@@ -1,12 +1,15 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+import importlib
+import inspect
+import logging
 import os
 import pickle
 import re
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Optional, List
 
 import torch
 import torchvision
@@ -25,11 +28,13 @@ from torch import Tensor, nn
 from transformers.configuration_auto import AutoConfig
 from transformers.modeling_auto import AutoModel
 
-
 try:
     from detectron2.modeling import ShapeSpec, build_resnet_backbone
 except ImportError:
     pass
+
+
+logger = logging.getLogger()
 
 
 class Encoder(nn.Module):
@@ -686,6 +691,146 @@ class PooledEncoder(Encoder):
         out = torch.flatten(out, start_dim=2)
         out = out.transpose(1, 2).contiguous()
         return out
+
+
+@registry.register_encoder("torchvideo")
+class TorchVideoEncoder(Encoder):
+    """Wrapper around importing torchvideo models"""
+
+    @dataclass
+    class Config(Encoder.Config):
+        name: str = "torchvideo"
+        random_init: bool = False
+        model_name: str = "slowfast_r50"
+        cls_layer_num: int = 1
+
+    def __init__(self, config: Config):
+        pytorchvideo_spec = importlib.util.find_spec("pytorchvideo")
+        if pytorchvideo_spec is None:
+            raise ImportError("pytorchvideo required for using TorchVideoEncoder")
+        import pytorchvideo.models as models
+
+        super().__init__()
+        config = OmegaConf.create({**asdict(self.Config()), **config})
+        if config.random_init:
+            model_create_fn_name = f"create_{config.model_name}"
+            model_create_fn = getattr(models, model_create_fn_name)
+            params = dict(**OmegaConf.to_container(config))
+            params.pop("random_init")
+            params.pop("model_name")
+            params.pop("cls_layer_num")
+
+            accepted_params, ignored_params = self.filter_dict_to_signature(
+                model_create_fn, params
+            )
+            if ignored_params:
+                ignored_params_str = " ".join(ignored_params.keys())
+                logger.warning(
+                    "The following model constructor params were ignored"
+                    + " because they don't match a named param in the"
+                    + f" constructor: {ignored_params_str}"
+                )
+            model = model_create_fn(**accepted_params)
+        else:
+            # load weights from TorchHub
+            model = torch.hub.load(
+                "facebookresearch/pytorchvideo:main",
+                model=config.model_name,
+                pretrained=True,
+            )
+
+        if config.cls_layer_num == 0:
+            self.encoder = model
+            return
+
+        modules_list = list(model.children())
+        if len(modules_list) == 1:
+            modules_list = list(modules_list[0].children())
+        modules = modules_list[: -config.cls_layer_num]
+        self.encoder = nn.Sequential(*modules)
+
+    def forward(self, *args, **kwargs):
+        # pass along input to model
+        # assumes caller obeys the dynamic model signature
+        return self.encoder(*args, **kwargs)
+
+    def filter_dict_to_signature(self, callable, params):
+        constructor_signature = inspect.signature(callable)  # Signature obj
+        constructor_params = constructor_signature.parameters
+        accepted_params = {
+            param_name: params[param_name]
+            for param_name in params
+            if param_name in constructor_params
+        }
+        ignored_params = {
+            param_name: params[param_name]
+            for param_name in params
+            if param_name not in constructor_params
+        }
+        return accepted_params, ignored_params
+
+
+@registry.register_encoder("mvit")
+class MViTEncoder(Encoder):
+    """MVIT from pytorchvideo"""
+
+    @dataclass
+    class Config(Encoder.Config):
+        name: str = "mvit"
+        random_init: bool = False
+        model_name: str = "multiscale_vision_transformers"
+        cls_layer_num: int = 0
+        spatial_size: int = 224
+        temporal_size: int = 8
+        encoder_pool_type: str = "cls"
+        head: Optional[Any] = None
+        embed_dim_mul: Optional[List] = None
+        atten_head_mul: Optional[List] = None
+        pool_q_stride_size: Optional[List] = None
+        pool_kv_stride_adaptive: Optional[List] = None
+        pool_kvq_kernel: Optional[List] = None
+
+    def __init__(self, config: Config):
+        super().__init__()
+        config = {**asdict(self.Config()), **config}
+        # initialize default lists
+        config["embed_dim_mul"] = config["embed_dim_mul"] or [
+            [1, 2.0],
+            [3, 2.0],
+            [14, 2.0],
+        ]
+        config["atten_head_mul"] = config["atten_head_mul"] or [
+            [1, 2.0],
+            [3, 2.0],
+            [14, 2.0],
+        ]
+        config["pool_q_stride_size"] = config["pool_q_stride_size"] or [
+            [1, 1, 2, 2],
+            [3, 1, 2, 2],
+            [14, 1, 2, 2],
+        ]
+        config["pool_kv_stride_adaptive"] = config["pool_kv_stride_adaptive"] or [
+            1,
+            8,
+            8,
+        ]
+        config["pool_kvq_kernel"] = config["pool_kvq_kernel"] or [3, 3, 3]
+
+        self.pool_type = config.pop("encoder_pool_type")
+        assert self.pool_type in (
+            "cls",
+            "avg",
+            "identity",
+        ), f"MViT encoder does not support pooling type '{self.pool_type}'."
+        self.encoder = TorchVideoEncoder(OmegaConf.create(config))
+
+    def forward(self, *args, **kwargs):
+        output = self.encoder(*args, **kwargs)
+        if self.pool_type == "cls":
+            output = output[:, :1, :]
+        elif self.pool_type == "avg":
+            output = output.mean(1).unsqueeze(1)
+        return output
 
 
 @registry.register_encoder("r2plus1d_18")
